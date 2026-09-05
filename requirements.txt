@@ -4,4 +4,4 @@ plotly
 openpyxl
 pdfplumber
 pytesseract
-pillow
+Pillow
