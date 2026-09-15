@@ -2,21 +2,26 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import re
+import numpy as np
 
-# Control de librerías para PDF y OCR/Escaneos
+# Control de librerías para PDF y OCR
 try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
 
 try:
+    import cv2
     import pytesseract
     from PIL import Image
+    # ⚠️ RUTA DE TESSERACT EN TU COMPUTADORA (Ajusta si es necesario)
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 except ImportError:
+    cv2 = None
     pytesseract = None
     Image = None
 
-# 1. CONFIGURACIÓN DE LA PÁGINA (Debe ser el primer comando)
+# 1. CONFIGURACIÓN DE LA PÁGINA
 st.set_page_config(
     page_title="Dashboard Ejecutivo | Análisis de Mercado",
     page_icon="📈",
@@ -24,336 +29,406 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. ESTILOS CSS PROFESIONALES Y MINIMALISTAS
+# 2. ESTILOS CSS PROFESIONALES
 st.markdown("""
     <style>
-    /* Fondo principal y tipografía */
-    .main { background-color: #F4F7FC; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    h1, h2, h3 { color: #0F172A; font-weight: 600; }
-    
-    /* Estilo de los botones */
-    .stButton>button { 
-        background-color: #1E3A8A; 
-        color: white; 
-        border-radius: 6px; 
-        border: none;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-        transition: all 0.3s ease;
-    }
-    .stButton>button:hover { background-color: #1E40AF; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
-    
-    /* Estilo para las métricas */
-    div[data-testid="stMetricValue"] { font-size: 28px; font-weight: 700; color: #1E3A8A; }
-    div[data-testid="stMetricLabel"] { font-size: 14px; color: #64748B; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-    
-    /* Separadores */
-    hr { margin-top: 1rem; margin-bottom: 1rem; border: 0; border-top: 1px solid #E2E8F0; }
-    
-    /* Ocultar menú de Streamlit para vista más limpia (opcional) */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    h1, h2, h3, h4 { color: #F8FAFC !important; font-weight: 700; }
+    .stButton>button { background-color: #3B82F6; color: white; border-radius: 6px; border: none; transition: 0.3s; }
+    .stButton>button:hover { background-color: #2563EB; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3); }
+    div[data-testid="stMetricValue"] { font-size: 32px; font-weight: 800; color: #3B82F6; }
+    div[data-testid="stMetricLabel"] { font-size: 13px; color: #94A3B8; font-weight: 600; text-transform: uppercase; }
+    .st-emotion-cache-1wivap2 { border-radius: 10px; border: 1px solid #334155; background: #1E293B; padding: 20px; }
+    .stAlert { background-color: rgba(16, 185, 129, 0.1) !important; color: #10B981 !important; border: 1px solid rgba(16,185,129,0.2); }
+    .stWarning { background-color: rgba(245, 158, 11, 0.1) !important; color: #F59E0B !important; border: 1px solid rgba(245,158,11,0.2); }
     </style>
     """, unsafe_allow_html=True)
 
+# 3. FUNCIONES DE PROCESAMIENTO
 
-# 3. FUNCIONES DE CLASIFICACIÓN Y PROCESAMIENTO
 def clasificar_origen(nombre_producto):
     nombre_str = str(nombre_producto).upper()
-    palabras_competencia = [
-        'OTRO_MARCA', 'COMPETIDOR_X', 'RIVAL', 'GENERICO', 'MARCA_X',
-        'COOPERVISION', 'ACUVUE', 'BIOFINITY', 'AIR OPTIX', 'DAILIES'
-    ]
+    palabras_competencia = ['OTRO_MARCA', 'COMPETIDOR_X', 'RIVAL', 'GENERICO', 'MARCA_X', 'COOPERVISION', 'ACUVUE', 'BIOFINITY', 'AIR OPTIX', 'DAILIES', 'CHEDRAUI', 'HUA XIN', 'FARMACIA']
     for palabra in palabras_competencia:
         if palabra in nombre_str:
             return 'Competencia'
     return 'Propio'
 
-def procesar_texto_extraido(texto, tipo_origen="Documento Escaneado / PDF"):
+def extraer_productos_de_texto(texto):
+    """
+    MOTOR DE EXTRACCIÓN LOCAL (Sin APIs)
+    Entiende tickets de Preventa, Farmacia Guadalajara, HUA XIN, Chedraui, etc.
+    """
     lineas = texto.split('\n')
     registros = []
-    for i, linea in enumerate(lineas):
-        linea_str = linea.strip()
-        if not linea_str or len(linea_str) < 3:
+    
+    palabras_ignoradas = [
+        'TOTAL', 'SUBTOTAL', 'FECHA', 'HORA', 'TEL', 'TELEFONO', 'RFC', 'IVA', 'GRACIAS', 
+        'CAMBIO', 'EFECTIVO', 'TARJETA', 'TICKET', 'FACTURA', 'CLIENTE', 'DIRECCION', 
+        'SUCURSAL', 'CAJERO', 'TERMINAL', 'AUTORIZACION', 'IMPORTE', 'PAGO', 'VENTA',
+        'DESCUENTO', 'AHORRO', 'BONIFICACION', 'CUPON', 'WWW.', 'CALLE', 'COL.', 'C.P.',
+        'FOLIO', 'REFERENCIA', 'SALDO', 'ATENDIDO', 'GARANTIA', 'EMPAQUE', 'MERCANCIA',
+        'PZ', 'PZA', 'PIEZA', 'ARTICULO', 'ARTICULOS', 'SUC', 'MEX', 'AV.', 'NO.', 'REF',
+        'CAJA', 'DESCRIPCION', 'PRECIO', 'VENTA', 'IMPORTE', 'ILEGIBLE', 'TOTALES', 'DEBIDO',
+        'PAGO', 'CREDITO', 'SALDO', 'ANTERIOR', 'DISPONIBLE'
+    ]
+    
+    i = 0
+    while i < len(lineas):
+        linea_actual = re.sub(r'[|\\[\]{}]', '', lineas[i]).strip()
+        linea_actual = re.sub(r'\s+', ' ', linea_actual)
+        
+        if not linea_actual or len(linea_actual) < 3:
+            i += 1
             continue
-        
-        cantidad = 1.0
-        producto = linea_str
-        
-        match_final = re.search(r'(.*?)\s+(\d+[\.,]?\d*)$', linea_str)
-        match_inicio = re.search(r'^(\d+[\.,]?\d*)\s+(.*)', linea_str)
+            
+        if any(p in linea_actual.upper() for p in palabras_ignoradas):
+            i += 1
+            continue
+            
+        if re.match(r'^[\d\s\.,\-\$]+$', linea_actual):
+            i += 1
+            continue
 
-        if match_final:
-            producto = match_final.group(1).strip()
-            try:
-                cantidad = float(match_final.group(2).replace(',', '.'))
-            except ValueError:
-                pass
-        elif match_inicio:
-            try:
-                cantidad = float(match_inicio.group(1).replace(',', '.'))
-            except ValueError:
-                pass
-            producto = match_inicio.group(2).strip()
+        cantidad, producto, precio_unit, total = 1.0, "", 0.0, 0.0
+        match_encontrado = False
 
-        origen = clasificar_origen(producto)
-        registros.append({
-            'ID_Pedido': f"DOC-{1000 + i}",
-            'Cantidad': cantidad,
-            'Categoria': tipo_origen,
-            'Producto': producto,
-            'Cliente': 'Cliente General',
-            'Origen': origen
-        })
+        # --- PATRÓN 1: Formato Chedraui / Supermercados ---
+        match1 = re.search(r'^(\d+[\.,]\d{3})\s*(.+?)\s*(\d+[\.,]\d{2})\s*(\d+[\.,]\d{2})', linea_actual)
+        if match1:
+            cantidad = float(match1.group(1).replace(',', '.'))
+            producto = match1.group(2).strip()
+            precio_unit = float(match1.group(3).replace(',', '.'))
+            total = float(match1.group(4).replace(',', '.'))
+            match_encontrado = True
+
+        # --- PATRÓN 2: Formato Farmacia Guadalajara ---
+        if not match_encontrado:
+            match2 = re.search(r'^(\d+)\s*(?:PZ|PZA|PIEZA)?\s+(.+?)\s+\$?(\d+[\.,]\d{2})$', linea_actual)
+            if match2:
+                cantidad = float(match2.group(1))
+                producto = match2.group(2).strip()
+                total = float(match2.group(3).replace(',', '.'))
+                precio_unit = total / cantidad if cantidad > 0 else total
+                match_encontrado = True
+
+        # --- PATRÓN 3: Formato HUA XIN (Cant x Precio Producto Total) ---
+        if not match_encontrado:
+            match3 = re.search(r'^(\d+)\s*[xX]?\s*(\d+[\.,]\d{2})\s+(.+?)\s+(\d+[\.,]\d{2})$', linea_actual)
+            if match3:
+                cantidad = float(match3.group(1))
+                precio_unit = float(match3.group(2).replace(',', '.'))
+                producto = match3.group(3).strip()
+                total = float(match3.group(4).replace(',', '.'))
+                match_encontrado = True
+
+        # --- PATRÓN 4: Formato Preventa (3 líneas por producto) ---
+        if not match_encontrado:
+            if re.search(r'[A-Za-z]', linea_actual) and not re.search(r'\d{7}', linea_actual):
+                if i + 1 < len(lineas):
+                    linea_siguiente = re.sub(r'\s+', ' ', lineas[i+1]).strip()
+                    match_clave = re.search(r'(\d{6,8})\s+(\d+)', linea_siguiente)
+                    if match_clave:
+                        cantidad_temp = float(match_clave.group(2))
+                        linea_precios = ""
+                        if i + 2 < len(lineas):
+                            linea_precios = re.sub(r'\s+', ' ', lineas[i+2]).strip()
+                        
+                        match_precios = re.search(r'([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})', linea_precios)
+                        if match_precios:
+                            cantidad = cantidad_temp
+                            producto = linea_actual
+                            precio_unit = float(match_precios.group(1).replace(',', ''))
+                            total = float(match_precios.group(3).replace(',', ''))
+                            match_encontrado = True
+                            i += 2
+
+        if match_encontrado and len(producto) > 3:
+            producto = re.sub(r'[*#]', '', producto)
+            producto = re.sub(r'\s+', ' ', producto).strip()
+            
+            registros.append({
+                'ID_Pedido': f"DOC-{1000 + i}",
+                'Cantidad': cantidad,
+                'Producto': producto,
+                'Precio_Unitario': precio_unit,
+                'Total': total,
+                'Cliente': 'Cliente General',
+                'Origen': clasificar_origen(producto)
+            })
+        i += 1
             
     if not registros:
-        registros.append({
-            'ID_Pedido': 'DOC-001', 'Cantidad': 1.0, 'Categoria': tipo_origen,
-            'Producto': 'Lectura de documento', 'Cliente': 'Cliente General', 'Origen': 'Propio'
-        })
+        return pd.DataFrame(columns=['ID_Pedido', 'Cantidad', 'Producto', 'Precio_Unitario', 'Total', 'Cliente', 'Origen'])
+    
     return pd.DataFrame(registros)
 
 def procesar_excel(archivo):
     df = pd.read_excel(archivo)
     df.columns = [str(c).strip() for c in df.columns]
     
-    col_pedido = 'Pedido' if 'Pedido' in df.columns else df.columns[0]
-    col_cantidad = 'Cantidad de producto' if 'Cantidad de producto' in df.columns else ('Cantidad' if 'Cantidad' in df.columns else None)
-    col_producto = 'Nombre del producto' if 'Nombre del producto' in df.columns else ('Producto' if 'Producto' in df.columns else None)
-    col_cliente = 'Óptica' if 'Óptica' in df.columns else ('Cliente' if 'Cliente' in df.columns else None)
-    col_origen = 'Origen' if 'Origen' in df.columns else None
-    col_categoria = 'Presentación' if 'Presentación' in df.columns else ('Ruta' if 'Ruta' in df.columns else None)
-
+    col_pedido = next((c for c in df.columns if 'pedido' in c.lower()), df.columns[0])
+    col_cantidad = next((c for c in df.columns if 'cantidad' in c.lower()), None)
+    col_producto = next((c for c in df.columns if 'producto' in c.lower() or 'nombre' in c.lower()), None)
+    col_cliente = next((c for c in df.columns if 'óptica' in c.lower() or 'cliente' in c.lower()), None)
+    col_origen = next((c for c in df.columns if 'origen' in c.lower()), None)
+    col_precio = next((c for c in df.columns if 'precio' in c.lower() or 'total' in c.lower()), None)
+    
     df_limpio = pd.DataFrame()
-    df_limpio['ID_Pedido'] = df[col_pedido] if col_pedido else df.index
+    df_limpio['ID_Pedido'] = df[col_pedido]
     df_limpio['Producto'] = df[col_producto] if col_producto else "Sin especificación"
     df_limpio['Cantidad'] = pd.to_numeric(df[col_cantidad], errors='coerce').fillna(1) if col_cantidad else 1.0
     df_limpio['Cliente'] = df[col_cliente] if col_cliente else "Cliente General"
-    df_limpio['Categoria'] = df[col_categoria] if col_categoria else "General"
+    df_limpio['Categoria'] = "General"
+    df_limpio['Total'] = pd.to_numeric(df[col_precio], errors='coerce').fillna(0) if col_precio else 0.0
+    df_limpio['Precio_Unitario'] = df_limpio['Total'] / df_limpio['Cantidad']
     
-    if col_origen and col_origen in df.columns:
+    if col_origen:
         df_limpio['Origen'] = df[col_origen].astype(str).str.strip().str.capitalize()
     else:
         df_limpio['Origen'] = df_limpio['Producto'].apply(clasificar_origen)
     return df_limpio
 
-def procesar_pdf(archivo):
-    texto_completo = ""
-    if pdfplumber is not None:
-        with pdfplumber.open(archivo) as pdf:
-            for pagina in pdf.pages:
-                tablas = pagina.extract_tables()
-                if tablas:
-                    for tabla in tablas:
-                        for fila in tabla:
-                            fila_limpia = [str(c).strip() for c in fila if c]
-                            if fila_limpia:
-                                texto_completo += " ".join(fila_limpia) + "\n"
-                else:
-                    texto = pagina.extract_text()
-                    if texto:
-                        texto_completo += texto + "\n"
-    else:
-        texto_completo = "PDF cargado sin librería de extracción"
-    return procesar_texto_extraido(texto_completo, tipo_origen="PDF")
+# 4. INTERFAZ PRINCIPAL
+st.title("📊 Dashboard Ejecutivo | Inteligencia de Mercado")
+st.markdown("Análisis automatizado de tickets, PDFs y reportes de ventas (100% Local).")
 
-def procesar_imagen(archivo):
-    texto_ocr = ""
-    if pytesseract is not None and Image is not None:
-        try:
-            imagen = Image.open(archivo)
-            texto_ocr = pytesseract.image_to_string(imagen)
-        except Exception:
-            texto_ocr = "Lectura de imagen/escaneo completada sin éxito"
-    else:
-        texto_ocr = "Imagen escaneada cargada (OCR no disponible)"
-    return procesar_texto_extraido(texto_ocr, tipo_origen="Escaneo OCR")
-
-@st.cache_data
-def cargar_documento(archivo_cargado):
-    nombre = archivo_cargado.name.lower()
-    if nombre.endswith(('.xlsx', '.xls')):
-        return procesar_excel(archivo_cargado)
-    elif nombre.endswith('.pdf'):
-        return procesar_pdf(archivo_cargado)
-    elif nombre.endswith(('.png', '.jpg', '.jpeg')):
-        return procesar_imagen(archivo_cargado)
-    else:
-        raise ValueError("Formato de archivo no compatible.")
-
-
-# 4. INTERFAZ DE USUARIO PRINCIPAL
-st.title("📈 Dashboard Ejecutivo | Inteligencia de Mercado")
-st.markdown("Plataforma de análisis comparativo de participación de mercado: **Propio vs Competencia**.")
-
-# PANEL LATERAL PROFESIONAL
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3094/3094939.png", width=60) # Icono decorativo opcional
+    st.image("https://cdn-icons-png.flaticon.com/512/3094/3094939.png", width=50)
     st.header("Gestor de Archivos")
     
-    archivo_subido = st.file_uploader(
-        "Cargar origen de datos",
-        type=["xlsx", "xls", "pdf", "png", "jpg", "jpeg"],
-        help="Soporta Excel, PDF y fotografías de tickets."
-    )
+    # ¡AQUÍ ESTÁ LA CORRECCIÓN! Aceptamos PDF e Imágenes de nuevo
+    archivo_subido = st.file_uploader("Sube tu archivo aquí", type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"])
+    
+    st.markdown("---")
+    st.markdown("### 📱 ¿Tienes una foto del ticket?")
+    st.info("""
+    1. Abre la foto en tu celular.
+    2. Usa **Google Lens** o la función **Copiar Texto**.
+    3. Pega el texto aquí abajo.
+    """)
+    
+    texto_manual = st.text_area("Pega aquí el texto del ticket:", height=150)
+    boton_manual = st.button("🚀 Procesar Texto del Ticket")
+
+# 5. LÓGICA PRINCIPAL
+if archivo_subido is not None or (boton_manual and texto_manual):
+    with st.spinner("Procesando datos..."):
+        
+        df = pd.DataFrame()
+        
+        # CASO 1: TEXTO MANUAL
+        if boton_manual and texto_manual:
+            df = extraer_productos_de_texto(texto_manual)
+                
+        # CASO 2: ARCHIVO SUBIDO
+        elif archivo_subido:
+            nombre = archivo_subido.name.lower()
+            
+            # 2.1 EXCEL / CSV
+            if nombre.endswith(('.xlsx', '.xls')):
+                df = procesar_excel(archivo_subido)
+            elif nombre.endswith('.csv'):
+                df = pd.read_csv(archivo_subido)
+                df.columns = [str(c).strip() for c in df.columns]
+                if 'Producto' not in df.columns and 'producto' in [c.lower() for c in df.columns]:
+                    df = df.rename(columns={c: 'Producto' for c in df.columns if c.lower() == 'producto'})
+                if 'Cantidad' not in df.columns and 'cantidad' in [c.lower() for c in df.columns]:
+                    df = df.rename(columns={c: 'Cantidad' for c in df.columns if c.lower() == 'cantidad'})
+                if 'Producto' in df.columns:
+                    df['Origen'] = df['Producto'].apply(clasificar_origen)
+                    if 'Total' not in df.columns: df['Total'] = 0.0
+                    if 'Precio_Unitario' not in df.columns: df['Precio_Unitario'] = df['Total'] / df['Cantidad'].replace(0, 1)
+                    if 'Cliente' not in df.columns: df['Cliente'] = 'Cliente General'
+                    if 'ID_Pedido' not in df.columns: df['ID_Pedido'] = 'DOC-001'
+            
+            # 2.2 PDF (¡Restaurado!)
+            elif nombre.endswith('.pdf'):
+                if pdfplumber:
+                    with pdfplumber.open(archivo_subido) as pdf:
+                        texto_pdf = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+                    df = extraer_productos_de_texto(texto_pdf)
+                else:
+                    st.error("Falta instalar pdfplumber. Ejecuta: pip install pdfplumber")
+                    
+            # 2.3 IMAGEN (¡Restaurado!)
+            elif nombre.endswith(('.png', '.jpg', '.jpeg')):
+                if cv2 is not None and pytesseract is not None:
+                    file_bytes = np.asarray(bytearray(archivo_subido.read()), dtype=np.uint8)
+                    img = cv2.imdecode(file_bytes, 1)
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    texto_ocr = pytesseract.image_to_string(thresh, lang='spa', config='--psm 6')
+                    df = extraer_productos_de_texto(texto_ocr)
+                else:
+                    st.error("Faltan las librerías de OCR (Tesseract/OpenCV). Revisa la instalación.")
+            else:
+                st.error("Formato no compatible.")
+
+        if df is None or df.empty:
+            st.warning("""
+            ⚠️ **No se pudieron detectar productos claros en este documento.**
+            Si subiste una imagen, intenta mejorar la foto o usa la caja de "Texto Manual" en el panel izquierdo.
+            """)
+            df = pd.DataFrame(columns=['ID_Pedido', 'Cantidad', 'Producto', 'Precio_Unitario', 'Total', 'Cliente', 'Origen'])
+
+    # Filtros
+    with st.expander("⚙️ Controles y Filtros Avanzados", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        cliente_sel = c1.selectbox("Cliente / Óptica:", ["Todos"] + list(df['Cliente'].unique()) if not df.empty else ["Todos"])
+        origen_sel = c2.multiselect("Origen:", df['Origen'].unique() if not df.empty else ["Propio"], default=df['Origen'].unique() if not df.empty else ["Propio"])
+        buscar = c3.text_input("Buscar producto:")
+
+    # Aplicar Filtros
+    df_filtrado = df.copy()
+    if not df_filtrado.empty:
+        if cliente_sel != "Todos": df_filtrado = df_filtrado[df_filtrado['Cliente'] == cliente_sel]
+        if origen_sel: df_filtrado = df_filtrado[df_filtrado['Origen'].isin(origen_sel)]
+        if buscar: df_filtrado = df_filtrado[df_filtrado['Producto'].str.contains(buscar, case=False, na=False)]
+
+    # Variables de resumen
+    total_uds = df_filtrado['Cantidad'].sum() if not df_filtrado.empty else 0
+    total_gasto = df_filtrado['Total'].sum() if not df_filtrado.empty else 0
+    total_prop = df_filtrado[df_filtrado['Origen']=='Propio']['Cantidad'].sum() if not df_filtrado.empty else 0
+    total_comp = df_filtrado[df_filtrado['Origen']=='Competencia']['Cantidad'].sum() if not df_filtrado.empty else 0
+    pct_prop = (total_prop/total_uds*100) if total_uds else 0
+    pct_comp = (total_comp/total_uds*100) if total_uds else 0
+
+    # Texto Explicativo del Resumen
+    st.markdown("### 📋 Resumen del Escaneo")
+    if not df_filtrado.empty:
+        st.info(f"""
+        **¿Qué estamos viendo?** 
+        El sistema ha leído el documento y extrajo un total de **{total_uds:,.0f} unidades** en **{len(df_filtrado)} líneas de productos**. 
+        El gasto total detectado es de **${total_gasto:,.2f} MXN**.
+        De este total, **{pct_prop:.1f}%** pertenecen a tu marca (Propio) y el **{pct_comp:.1f}%** pertenece a la Competencia. 
+        *Nota: Si el escáner cometió un error, puedes corregirlo manualmente en la pestaña "Editar Datos".*
+        """)
+
+    # KPIs
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Volumen Total", f"{total_uds:,.0f} uds")
+    m2.metric("Gasto Total", f"${total_gasto:,.2f}")
+    m3.metric("Market Share Propio", f"{total_prop:,.0f} uds", f"{pct_prop:.1f}%")
+    m4.metric("Market Share Competencia", f"{total_comp:,.0f} uds", f"-{pct_comp:.1f}%", delta_color="inverse")
 
     st.markdown("---")
-    st.caption("✔️ Excel (.xlsx, .xls)")
-    st.caption("✔️ Documentos (.pdf)")
-    st.caption("✔️ Fotografías/Tickets (.jpg, .png)")
 
+    # Pestañas
+    tab1, tab2, tab3 = st.tabs(["📊 Gráficos", "✏️ Editar Datos", "🤖 Asistente Copilot"])
 
-# 5. LÓGICA PRINCIPAL SI HAY ARCHIVO
-if archivo_subido is not None:
-    try:
-        df = cargar_documento(archivo_subido)
-
-        # MENSAJES DE ESTADO
-        if archivo_subido.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            st.warning("⚠️ **VERIFICACIÓN REQUERIDA:** Se ha detectado la carga de una imagen (Ticket/Escaneo). Por favor, verifique en la pestaña 'Datos Detallados' que el motor OCR haya extraído las cantidades correctamente.")
+    with tab1:
+        if not df_filtrado.empty:
+            g1, g2 = st.columns(2)
+            with g1:
+                fig1 = px.pie(df_filtrado, values='Cantidad', names='Origen', hole=0.4, title="Participación de Mercado", color='Origen', color_discrete_map={'Propio': '#3B82F6', 'Competencia': '#F43F5E'})
+                fig1.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#F8FAFC'))
+                st.plotly_chart(fig1, use_container_width=True)
+            with g2:
+                top = df_filtrado.groupby(['Producto', 'Origen'])['Cantidad'].sum().reset_index().nlargest(10, 'Cantidad')
+                fig2 = px.bar(top, x='Cantidad', y='Producto', color='Origen', orientation='h', title="Top 10 Productos por Unidades", color_discrete_map={'Propio': '#3B82F6', 'Competencia': '#F43F5E'})
+                fig2.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#F8FAFC'))
+                st.plotly_chart(fig2, use_container_width=True)
         else:
-            st.success(f"📄 Archivo procesado exitosamente: **{archivo_subido.name}**")
+            st.info("Sube un archivo con datos válidos para ver los gráficos.")
 
-        # ---------------------------------------------------------
-        # FILTROS AVANZADOS (OCULTOS EN UN EXPANDER PARA LIMPIEZA)
-        # ---------------------------------------------------------
-        with st.expander("⚙️ Filtros Avanzados de Información", expanded=False):
-            col_filtro1, col_filtro2, col_filtro3 = st.columns(3)
+    with tab2:
+        st.markdown("### ✏️ Edición Interactiva de Datos")
+        st.caption("¿El escáner cometió un error? Haz doble clic en cualquier celda para corregir.")
+        
+        df_editado = st.data_editor(
+            df_filtrado, 
+            use_container_width=True, 
+            num_rows="dynamic", 
+            hide_index=True
+        )
+        
+        csv = df_editado.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Descargar Datos Editados (CSV)", 
+            data=csv, 
+            file_name='reporte_corregido.csv', 
+            mime='text/csv'
+        )
+
+    with tab3:
+        st.markdown("### 💬 Copilot de Datos (Análisis Avanzado)")
+        if "mensajes" not in st.session_state:
+            st.session_state.mensajes = [{"role": "assistant", "content": "¡Hola! Soy tu asistente de datos. Prueba preguntando:\n- 'Dame un resumen detallado'\n- 'Lista todos los productos'\n- '¿Cuáles son los productos de la competencia?'\n- '¿Cuánto gasté en total?'"}]
+
+        for msg in st.session_state.mensajes:
+            st.chat_message(msg["role"]).write(msg["content"])
+
+        if prompt := st.chat_input("Pregúntale a los datos..."):
+            st.session_state.mensajes.append({"role": "user", "content": prompt})
+            st.chat_message("user").write(prompt)
+
+            txt = prompt.lower()
             
-            with col_filtro1:
-                lista_clientes = ["Todos"] + list(df['Cliente'].dropna().unique()) if 'Cliente' in df.columns else ["Todos"]
-                cliente_seleccionado = st.selectbox("Óptica / Cliente:", lista_clientes)
-                
-            with col_filtro2:
-                origenes_disponibles = list(df['Origen'].unique()) if 'Origen' in df.columns else ['Propio', 'Competencia']
-                origen_seleccionado = st.multiselect("Origen del Producto:", options=origenes_disponibles, default=origenes_disponibles)
-                
-            with col_filtro3:
-                texto_busqueda = st.text_input("🔎 Búsqueda rápida de producto:", placeholder="Ej. Acuvue...")
+            if "resumen" in txt or "detallado" in txt:
+                top_prod = df_filtrado.groupby('Producto')['Cantidad'].sum().idxmax() if not df_filtrado.empty else "N/A"
+                resp = f"""**📊 Resumen Detallado:**
+- **Total Unidades:** {total_uds:,.0f} uds
+- **Gasto Total:** ${total_gasto:,.2f} MXN
+- **Total Líneas/Productos:** {len(df_filtrado)}
+- **Producto Estrella:** {top_prod}
+- **Tu Marca (Propio):** {total_prop:,.0f} uds ({pct_prop:.1f}%)
+- **Competencia:** {total_comp:,.0f} uds ({pct_comp:.1f}%)"""
 
-        # APLICAR FILTROS
-        df_filtrado = df.copy()
-        if cliente_seleccionado != "Todos" and 'Cliente' in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado['Cliente'] == cliente_seleccionado]
-        if origen_seleccionado and 'Origen' in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado['Origen'].isin(origen_seleccionado)]
-        if texto_busqueda.strip() and 'Producto' in df_filtrado.columns:
-            df_filtrado = df_filtrado[df_filtrado['Producto'].astype(str).str.lower().str.contains(texto_busqueda.strip().lower(), na=False)]
-
-        # ---------------------------------------------------------
-        # TARJETAS DE MÉTRICAS (KPIs)
-        # ---------------------------------------------------------
-        st.markdown("### 📊 Resumen Ejecutivo")
-        col_met1, col_met2, col_met3 = st.columns(3)
-
-        total_productos = df_filtrado['Cantidad'].sum() if 'Cantidad' in df_filtrado.columns else 0
-        if 'Origen' in df_filtrado.columns and 'Cantidad' in df_filtrado.columns:
-            total_propios = df_filtrado[df_filtrado['Origen'].str.lower() == 'propio']['Cantidad'].sum()
-            total_competencia = df_filtrado[df_filtrado['Origen'].str.lower() == 'competencia']['Cantidad'].sum()
-        else:
-            total_propios = total_productos
-            total_competencia = 0
-
-        pct_propio = (total_propios / total_productos * 100) if total_productos > 0 else 0
-        pct_competencia = (total_competencia / total_productos * 100) if total_productos > 0 else 0
-
-        with col_met1:
-            st.metric(label="Volumen Total (Unidades)", value=f"{total_productos:,.0f}")
-        with col_met2:
-            st.metric(label="Market Share (Propio)", value=f"{total_propios:,.0f}", delta=f"{pct_propio:.1f}%")
-        with col_met3:
-            st.metric(label="Market Share (Competencia)", value=f"{total_competencia:,.0f}", delta=f"{-pct_competencia:.1f}%", delta_color="inverse")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ---------------------------------------------------------
-        # PESTAÑAS DE NAVEGACIÓN (TABS)
-        # ---------------------------------------------------------
-        tab_graficos, tab_datos, tab_asistente = st.tabs([
-            "📊 Gráficos de Negocio", 
-            "📋 Datos Detallados", 
-            "🤖 Asistente de Análisis"
-        ])
-
-        # --- PESTAÑA 1: GRÁFICOS ---
-        with tab_graficos:
-            if df_filtrado.empty:
-                st.info("No hay datos para graficar con los filtros actuales.")
-            else:
-                col_g1, col_g2 = st.columns(2)
-                
-                with col_g1:
-                    resumen_origen = df_filtrado.groupby('Origen')['Cantidad'].sum().reset_index()
-                    fig_pie = px.pie(
-                        resumen_origen, values='Cantidad', names='Origen',
-                        color='Origen', color_discrete_map={'Propio': '#1E3A8A', 'Competencia': '#EF4444'},
-                        hole=0.5, title="Distribución de Participación"
-                    )
-                    # Estilo limpio para Plotly
-                    fig_pie.update_layout(template="plotly_white", margin=dict(t=40, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-                with col_g2:
-                    resumen_prod = df_filtrado.groupby(['Producto', 'Origen'])['Cantidad'].sum().reset_index().sort_values(by='Cantidad', ascending=True).tail(10)
-                    fig_bar = px.bar(
-                        resumen_prod, x='Cantidad', y='Producto', color='Origen', orientation='h',
-                        color_discrete_map={'Propio': '#1E3A8A', 'Competencia': '#EF4444'},
-                        title="Top 10 Productos con Mayor Volumen"
-                    )
-                    fig_bar.update_layout(template="plotly_white", margin=dict(t=40, b=10, l=10, r=10), paper_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig_bar, use_container_width=True)
-
-        # --- PESTAÑA 2: DATOS DETALLADOS ---
-        with tab_datos:
-            st.markdown("#### Matriz de Datos")
-            cols_mostrar = [c for c in ['ID_Pedido', 'Producto', 'Categoria', 'Cliente', 'Origen', 'Cantidad'] if c in df_filtrado.columns]
-            st.dataframe(df_filtrado[cols_mostrar], hide_index=True, use_container_width=True, height=400)
-
-        # --- PESTAÑA 3: ASISTENTE ---
-        with tab_asistente:
-            st.markdown("#### 💬 Consultor Analítico")
-            prompt_usuario = st.text_area(
-                "Realice una consulta en lenguaje natural sobre la matriz de datos:",
-                placeholder="Ej. Dame un resumen de la competencia. / ¿Cuál es el producto más vendido?",
-                height=80
-            )
-
-            if prompt_usuario.strip():
-                txt = prompt_usuario.strip().lower()
-                st.markdown("##### 💡 Respuesta:")
-
-                if "competencia" in txt or "rival" in txt:
-                    df_comp = df_filtrado[df_filtrado['Origen'].str.lower() == 'competencia']
-                    st.warning(f"Se identificaron **{len(df_comp)} registros** de la competencia ({df_comp['Cantidad'].sum():,.0f} unidades).")
-                    st.dataframe(df_comp[['Producto', 'Cantidad']], hide_index=True)
-
-                elif "propio" in txt or "propios" in txt or "nuestros" in txt:
-                    df_prop = df_filtrado[df_filtrado['Origen'].str.lower() == 'propio']
-                    st.success(f"Se encontraron **{len(df_prop)} registros propios** ({df_prop['Cantidad'].sum():,.0f} unidades).")
-                    st.dataframe(df_prop[['Producto', 'Cantidad']], hide_index=True)
-
-                elif any(word in txt for word in ["mas vendido", "mayor cantidad", "top", "máximo", "maximo"]):
-                    top_prod = df_filtrado.groupby(['Producto', 'Origen'])['Cantidad'].sum().reset_index().sort_values(by='Cantidad', ascending=False)
-                    lider = top_prod.iloc[0]
-                    st.success(f"🏆 Producto líder: **{lider['Producto']}** ({lider['Origen']}) con **{lider['Cantidad']:,.0f} unidades**.")
-
-                elif any(word in txt for word in ["resumen", "analisis", "general", "cuota"]):
-                    st.info(f"**Análisis de cuota actual:**\n\n- **Volumen total:** {total_productos:,.0f} uds.\n- **Propio:** {pct_propio:.1f}% ({total_propios:,.0f} uds.)\n- **Competencia:** {pct_competencia:.1f}% ({total_competencia:,.0f} uds.)")
-                
+            elif "lista" in txt or "productos" in txt or "todo" in txt:
+                if df_filtrado.empty:
+                    resp = "No hay productos en la lista actual."
                 else:
-                    coincidencias = df_filtrado[df_filtrado.apply(lambda row: row.astype(str).str.lower().str.contains(txt, na=False).any(), axis=1)]
-                    if not coincidencias.empty:
-                        st.dataframe(coincidencias, hide_index=True)
-                    else:
-                        st.info("No se encontraron coincidencias. Prueba con términos como 'competencia', 'top' o 'resumen'.")
+                    resp = "**📋 Listado de Productos Extraídos:**\n\n"
+                    resp += "| Producto | Cantidad | Precio Unit. | Total | Origen |\n|---|---|---|---|---|\n"
+                    for _, row in df_filtrado.iterrows():
+                        resp += f"| {row['Producto']} | {row['Cantidad']} | ${row['Precio_Unitario']:,.2f} | ${row['Total']:,.2f} | {row['Origen']} |\n"
 
-    except Exception as e:
-        st.error(f"Error técnico en el procesamiento del archivo: {e}")
+            elif "competencia" in txt:
+                df_comp = df_filtrado[df_filtrado['Origen'] == 'Competencia']
+                if df_comp.empty:
+                    resp = "No se detectaron productos de la competencia en este documento."
+                else:
+                    resp = f"**🔴 Productos de la Competencia ({total_comp:,.0f} uds):**\n\n"
+                    for _, row in df_comp.iterrows():
+                        resp += f"- **{row['Producto']}**: {row['Cantidad']} uds | Total: ${row['Total']:,.2f}\n"
+
+            elif "propio" in txt or "marca" in txt or "mía" in txt:
+                df_prop = df_filtrado[df_filtrado['Origen'] == 'Propio']
+                resp = f"**🔵 Tus Productos ({total_prop:,.0f} uds):**\n\n"
+                for _, row in df_prop.iterrows():
+                    resp += f"- **{row['Producto']}**: {row['Cantidad']} uds | Total: ${row['Total']:,.2f}\n"
+
+            elif "gasto" in txt or "dinero" in txt or "total" in txt:
+                resp = f"💰 **Análisis de Gasto:**\n\nEl gasto total detectado es de **${total_gasto:,.2f} MXN**.\n\n"
+                if not df_filtrado.empty:
+                    top_gasto = df_filtrado.groupby('Producto')['Total'].sum().nlargest(3)
+                    resp += "**Top 3 productos que más gasto generaron:**\n"
+                    for prod, monto in top_gasto.items():
+                        resp += f"- {prod}: ${monto:,.2f}\n"
+
+            elif "top" in txt or "mejor" in txt or "más" in txt:
+                if df_filtrado.empty:
+                    resp = "No hay productos para calcular el Top."
+                else:
+                    top = df_filtrado.groupby(['Producto', 'Origen'])['Cantidad'].sum().reset_index().nlargest(5, 'Cantidad')
+                    resp = "**🏆 Top 5 Productos por Unidades:**\n\n"
+                    for _, row in top.iterrows():
+                        resp += f"- **{row['Producto']}** ({row['Origen']}): {row['Cantidad']} uds\n"
+
+            else:
+                encontrado = False
+                for _, row in df_filtrado.iterrows():
+                    if row['Producto'].lower() in txt:
+                        resp = f"🔍 **Detalle del producto encontrado:**\n- **Producto:** {row['Producto']}\n- **Cantidad:** {row['Cantidad']} uds\n- **Precio Unitario:** ${row['Precio_Unitario']:,.2f}\n- **Total:** ${row['Total']:,.2f}\n- **Origen:** {row['Origen']}"
+                        encontrado = True
+                        break
+                
+                if not encontrado:
+                    resp = f"No encontré una coincidencia exacta para '{prompt}'. Intenta usar palabras clave como 'resumen', 'lista', 'competencia', 'propio', 'gasto' o el nombre exacto de un producto."
+
+            st.session_state.mensajes.append({"role": "assistant", "content": resp})
+            st.chat_message("assistant").write(resp)
 
 else:
-    # Pantalla de bienvenida limpia
-    st.info("👋 Bienvenido al Dashboard. Por favor, **cargue un archivo desde el menú lateral** para iniciar el análisis.")
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    col1.markdown("📄 **Procesamiento PDF:**\nExtracción inteligente de tablas y formatos.")
-    col2.markdown("📸 **Escáner OCR:**\nLectura automatizada de tickets fotográficos.")
-    col3.markdown("🤖 **Asistente IA:**\nConsulta de datos mediante lenguaje natural.")
+    st.info("👋 Sube un archivo (Excel, PDF, Imagen) o pega el texto de un ticket en el panel lateral para comenzar.")
