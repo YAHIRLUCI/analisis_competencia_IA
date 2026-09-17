@@ -1,7 +1,9 @@
 streamlit
 pandas
 plotly
-openpyxl
-pdfplumber
+numpy
+opencv-python-headless
 pytesseract
+pdfplumber
 Pillow
+requests
