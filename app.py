@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import re
 import numpy as np
+import requests
 
 # Control de librerías para PDF y OCR
 try:
@@ -14,7 +15,6 @@ try:
     import cv2
     import pytesseract
     from PIL import Image
-    # ⚠️ RUTA DE TESSERACT EN TU COMPUTADORA (Ajusta si es necesario)
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 except ImportError:
     cv2 = None
@@ -53,11 +53,20 @@ def clasificar_origen(nombre_producto):
             return 'Competencia'
     return 'Propio'
 
+def corregir_errores_ocr(texto):
+    reemplazos = {
+        r'(?<=\d)O': '0',
+        r'(?<=\d)l': '1',
+        r'\bl(?=\d)': '1',
+        r'[|]': 'I',
+        r'[—–]': '-',
+    }
+    for patron, reemplazo in reemplazos.items():
+        texto = re.sub(patron, reemplazo, texto)
+    return texto
+
 def extraer_productos_de_texto(texto):
-    """
-    MOTOR DE EXTRACCIÓN LOCAL (Sin APIs)
-    Entiende tickets de Preventa, Farmacia Guadalajara, HUA XIN, Chedraui, etc.
-    """
+    """Motor de extracción local que entiende múltiples formatos de tickets."""
     lineas = texto.split('\n')
     registros = []
     
@@ -69,7 +78,8 @@ def extraer_productos_de_texto(texto):
         'FOLIO', 'REFERENCIA', 'SALDO', 'ATENDIDO', 'GARANTIA', 'EMPAQUE', 'MERCANCIA',
         'PZ', 'PZA', 'PIEZA', 'ARTICULO', 'ARTICULOS', 'SUC', 'MEX', 'AV.', 'NO.', 'REF',
         'CAJA', 'DESCRIPCION', 'PRECIO', 'VENTA', 'IMPORTE', 'ILEGIBLE', 'TOTALES', 'DEBIDO',
-        'PAGO', 'CREDITO', 'SALDO', 'ANTERIOR', 'DISPONIBLE'
+        'PAGO', 'CREDITO', 'SALDO', 'ANTERIOR', 'DISPONIBLE', 'PRESENTA', 'EXIGE', 'GRACIAS',
+        'AHORRANDO', 'CONTIGO', 'COMPROBANTE', 'ENTREGA', 'USO', 'INTERNO'
     ]
     
     i = 0
@@ -92,7 +102,7 @@ def extraer_productos_de_texto(texto):
         cantidad, producto, precio_unit, total = 1.0, "", 0.0, 0.0
         match_encontrado = False
 
-        # --- PATRÓN 1: Formato Chedraui / Supermercados ---
+        # PATRÓN 1: Chedraui / Supermercados (3 decimales)
         match1 = re.search(r'^(\d+[\.,]\d{3})\s*(.+?)\s*(\d+[\.,]\d{2})\s*(\d+[\.,]\d{2})', linea_actual)
         if match1:
             cantidad = float(match1.group(1).replace(',', '.'))
@@ -101,7 +111,7 @@ def extraer_productos_de_texto(texto):
             total = float(match1.group(4).replace(',', '.'))
             match_encontrado = True
 
-        # --- PATRÓN 2: Formato Farmacia Guadalajara ---
+        # PATRÓN 2: Farmacia Guadalajara
         if not match_encontrado:
             match2 = re.search(r'^(\d+)\s*(?:PZ|PZA|PIEZA)?\s+(.+?)\s+\$?(\d+[\.,]\d{2})$', linea_actual)
             if match2:
@@ -111,7 +121,7 @@ def extraer_productos_de_texto(texto):
                 precio_unit = total / cantidad if cantidad > 0 else total
                 match_encontrado = True
 
-        # --- PATRÓN 3: Formato HUA XIN (Cant x Precio Producto Total) ---
+        # PATRÓN 3: HUA XIN (Cant x Precio Producto Total)
         if not match_encontrado:
             match3 = re.search(r'^(\d+)\s*[xX]?\s*(\d+[\.,]\d{2})\s+(.+?)\s+(\d+[\.,]\d{2})$', linea_actual)
             if match3:
@@ -121,7 +131,7 @@ def extraer_productos_de_texto(texto):
                 total = float(match3.group(4).replace(',', '.'))
                 match_encontrado = True
 
-        # --- PATRÓN 4: Formato Preventa (3 líneas por producto) ---
+        # PATRÓN 4: Preventa (3 líneas por producto)
         if not match_encontrado:
             if re.search(r'[A-Za-z]', linea_actual) and not re.search(r'\d{7}', linea_actual):
                 if i + 1 < len(lineas):
@@ -141,6 +151,16 @@ def extraer_productos_de_texto(texto):
                             total = float(match_precios.group(3).replace(',', ''))
                             match_encontrado = True
                             i += 2
+
+        # PATRÓN 5: Genérico de Respaldo
+        if not match_encontrado:
+            match5 = re.search(r'^(\d+[\.,]?\d*)\s+([A-Za-z].*?)\s+\$?(\d+[\.,]\d{2})$', linea_actual)
+            if match5:
+                cantidad = float(match5.group(1).replace(',', '.'))
+                producto = match5.group(2).strip()
+                total = float(match5.group(3).replace(',', '.'))
+                precio_unit = total / cantidad if cantidad > 0 else 0
+                match_encontrado = True
 
         if match_encontrado and len(producto) > 3:
             producto = re.sub(r'[*#]', '', producto)
@@ -162,6 +182,98 @@ def extraer_productos_de_texto(texto):
     
     return pd.DataFrame(registros)
 
+def leer_con_ocr_space(archivo_bytes, nombre_archivo, api_key):
+    """Usa OCR.space enviando el archivo correctamente con nombre y tipo MIME."""
+    try:
+        # Detectar el tipo MIME correcto según la extensión
+        extension = nombre_archivo.lower().split('.')[-1]
+        mime_types = {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'pdf': 'application/pdf',
+            'bmp': 'image/bmp',
+            'gif': 'image/gif',
+            'tiff': 'image/tiff',
+            'webp': 'image/webp'
+        }
+        mime_type = mime_types.get(extension, 'application/octet-stream')
+        
+        # Enviar con el nombre y tipo MIME correctos
+        files = {
+            'file': (nombre_archivo, archivo_bytes, mime_type)
+        }
+        
+        data = {
+            'apikey': api_key,
+            'language': 'spa',
+            'isOverlayRequired': False,
+            'detectOrientation': True,
+            'scale': True,
+            'OCREngine': 2,
+            'isTable': True,
+            'filetype': extension.upper()
+        }
+        
+        response = requests.post(
+            'https://api.ocr.space/parse/image',
+            files=files,
+            data=data,
+            timeout=120
+        )
+        
+        resultado = response.json()
+        
+        # Verificar errores específicos de OCR.space
+        if resultado.get('IsErroredOnProcessing'):
+            error_msg = resultado.get('ErrorMessage', ['Error desconocido'])
+            if isinstance(error_msg, list):
+                error_msg = ' | '.join(str(e) for e in error_msg)
+            return None, f"Error OCR.space: {error_msg}"
+        
+        if resultado.get('ParsedResults'):
+            texto = resultado['ParsedResults'][0].get('ParsedText', '')
+            if texto.strip():
+                return texto, None
+            return None, "OCR.space no detectó texto en la imagen."
+        
+        return None, f"Respuesta vacía. Respuesta completa: {resultado}"
+        
+    except Exception as e:
+        return None, f"Error de conexión: {str(e)}"
+
+def procesar_imagen_tesseract(archivo):
+    """Fallback: Tesseract con preprocesamiento avanzado"""
+    if cv2 is None or pytesseract is None:
+        return None, "Tesseract no está instalado."
+    try:
+        file_bytes = np.asarray(bytearray(archivo.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, 1)
+        img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(denoised)
+        binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        
+        coords = np.column_stack(np.where(binary > 0))
+        if len(coords) > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+            (h, w) = binary.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            binary = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        
+        texto_ocr = pytesseract.image_to_string(binary, lang='spa', config='--oem 3 --psm 6')
+        texto_ocr = corregir_errores_ocr(texto_ocr)
+        return texto_ocr, None
+    except Exception as e:
+        return None, f"Error Tesseract: {str(e)}"
+
 def procesar_excel(archivo):
     df = pd.read_excel(archivo)
     df.columns = [str(c).strip() for c in df.columns]
@@ -180,7 +292,7 @@ def procesar_excel(archivo):
     df_limpio['Cliente'] = df[col_cliente] if col_cliente else "Cliente General"
     df_limpio['Categoria'] = "General"
     df_limpio['Total'] = pd.to_numeric(df[col_precio], errors='coerce').fillna(0) if col_precio else 0.0
-    df_limpio['Precio_Unitario'] = df_limpio['Total'] / df_limpio['Cantidad']
+    df_limpio['Precio_Unitario'] = df_limpio['Total'] / df_limpio['Cantidad'].replace(0, 1)
     
     if col_origen:
         df_limpio['Origen'] = df[col_origen].astype(str).str.strip().str.capitalize()
@@ -190,31 +302,49 @@ def procesar_excel(archivo):
 
 # 4. INTERFAZ PRINCIPAL
 st.title("📊 Dashboard Ejecutivo | Inteligencia de Mercado")
-st.markdown("Análisis automatizado de tickets, PDFs y reportes de ventas (100% Local).")
+st.markdown("Análisis automatizado de tickets, PDFs y reportes de ventas.")
 
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3094/3094939.png", width=50)
     st.header("Gestor de Archivos")
     
-    # ¡AQUÍ ESTÁ LA CORRECCIÓN! Aceptamos PDF e Imágenes de nuevo
-    archivo_subido = st.file_uploader("Sube tu archivo aquí", type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"])
+    st.markdown("### 🔑 OCR Inteligente")
+    st.markdown("Obtén una clave gratis en [ocr.space/ocrapi](https://ocr.space/ocrapi).")
+    ocr_api_key = st.text_input(
+        "Clave de OCR.space:",
+        type="password",
+        value=st.session_state.get('ocr_api_key', ''),
+    )
+    if ocr_api_key:
+        st.session_state['ocr_api_key'] = ocr_api_key
+    
+    if not ocr_api_key:
+        st.warning("⚠️ Sin clave, la lectura de fotos será básica.")
     
     st.markdown("---")
-    st.markdown("### 📱 ¿Tienes una foto del ticket?")
+    
+    archivo_subido = st.file_uploader("Sube tu archivo aquí", type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"])
+    
+    if archivo_subido:
+        st.success("✅ Archivo cargado correctamente.")
+    
+    st.markdown("---")
+    st.markdown("### 📱 ¿La foto no se lee?")
     st.info("""
     1. Abre la foto en tu celular.
-    2. Usa **Google Lens** o la función **Copiar Texto**.
+    2. Usa **Google Lens** o **Copiar Texto**.
     3. Pega el texto aquí abajo.
     """)
     
     texto_manual = st.text_area("Pega aquí el texto del ticket:", height=150)
-    boton_manual = st.button("🚀 Procesar Texto del Ticket")
+    boton_manual = st.button("🚀 Procesar Texto Manual")
 
 # 5. LÓGICA PRINCIPAL
 if archivo_subido is not None or (boton_manual and texto_manual):
     with st.spinner("Procesando datos..."):
         
         df = pd.DataFrame()
+        mensaje_error = None
         
         # CASO 1: TEXTO MANUAL
         if boton_manual and texto_manual:
@@ -241,35 +371,56 @@ if archivo_subido is not None or (boton_manual and texto_manual):
                     if 'Cliente' not in df.columns: df['Cliente'] = 'Cliente General'
                     if 'ID_Pedido' not in df.columns: df['ID_Pedido'] = 'DOC-001'
             
-            # 2.2 PDF (¡Restaurado!)
+            # 2.2 PDF
             elif nombre.endswith('.pdf'):
                 if pdfplumber:
                     with pdfplumber.open(archivo_subido) as pdf:
                         texto_pdf = "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
                     df = extraer_productos_de_texto(texto_pdf)
                 else:
-                    st.error("Falta instalar pdfplumber. Ejecuta: pip install pdfplumber")
+                    mensaje_error = "Falta instalar pdfplumber."
                     
-            # 2.3 IMAGEN (¡Restaurado!)
+            # 2.3 IMAGEN
             elif nombre.endswith(('.png', '.jpg', '.jpeg')):
-                if cv2 is not None and pytesseract is not None:
-                    file_bytes = np.asarray(bytearray(archivo_subido.read()), dtype=np.uint8)
-                    img = cv2.imdecode(file_bytes, 1)
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    texto_ocr = pytesseract.image_to_string(thresh, lang='spa', config='--psm 6')
-                    df = extraer_productos_de_texto(texto_ocr)
-                else:
-                    st.error("Faltan las librerías de OCR (Tesseract/OpenCV). Revisa la instalación.")
+                texto_extraido = None
+                
+                # PRIMERO: Intentar con OCR.space (si hay API key)
+                if ocr_api_key:
+                    archivo_subido.seek(0)
+                    archivo_bytes = archivo_subido.read()
+                    texto_extraido, error_ocr = leer_con_ocr_space(archivo_bytes, archivo_subido.name, ocr_api_key)
+                    if error_ocr:
+                        mensaje_error = error_ocr
+                        texto_extraido = None
+                
+                # SEGUNDO: Fallback a Tesseract
+                if texto_extraido is None and not mensaje_error:
+                    archivo_subido.seek(0)
+                    texto_extraido, error_tess = procesar_imagen_tesseract(archivo_subido)
+                    if error_tess:
+                        mensaje_error = error_tess
+                
+                if texto_extraido:
+                    df = extraer_productos_de_texto(texto_extraido)
             else:
-                st.error("Formato no compatible.")
+                mensaje_error = "Formato no compatible."
+
+        if mensaje_error:
+            st.error(f"❌ {mensaje_error}")
 
         if df is None or df.empty:
-            st.warning("""
-            ⚠️ **No se pudieron detectar productos claros en este documento.**
-            Si subiste una imagen, intenta mejorar la foto o usa la caja de "Texto Manual" en el panel izquierdo.
-            """)
+            if ocr_api_key:
+                st.warning("""
+                ⚠️ **No se pudieron detectar productos claros en este documento.**
+                
+                Prueba con la caja de **"Texto Manual"** en el panel izquierdo (usa Google Lens en tu celular).
+                """)
+            else:
+                st.warning("""
+                ⚠️ **No se pudieron detectar productos claros en este documento.**
+                
+                **Recomendación:** Ingresa tu clave de OCR.space en el panel izquierdo para leer fotos con alta precisión.
+                """)
             df = pd.DataFrame(columns=['ID_Pedido', 'Cantidad', 'Producto', 'Precio_Unitario', 'Total', 'Cliente', 'Origen'])
 
     # Filtros
@@ -294,7 +445,6 @@ if archivo_subido is not None or (boton_manual and texto_manual):
     pct_prop = (total_prop/total_uds*100) if total_uds else 0
     pct_comp = (total_comp/total_uds*100) if total_uds else 0
 
-    # Texto Explicativo del Resumen
     st.markdown("### 📋 Resumen del Escaneo")
     if not df_filtrado.empty:
         st.info(f"""
@@ -302,10 +452,8 @@ if archivo_subido is not None or (boton_manual and texto_manual):
         El sistema ha leído el documento y extrajo un total de **{total_uds:,.0f} unidades** en **{len(df_filtrado)} líneas de productos**. 
         El gasto total detectado es de **${total_gasto:,.2f} MXN**.
         De este total, **{pct_prop:.1f}%** pertenecen a tu marca (Propio) y el **{pct_comp:.1f}%** pertenece a la Competencia. 
-        *Nota: Si el escáner cometió un error, puedes corregirlo manualmente en la pestaña "Editar Datos".*
         """)
 
-    # KPIs
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Volumen Total", f"{total_uds:,.0f} uds")
     m2.metric("Gasto Total", f"${total_gasto:,.2f}")
@@ -314,7 +462,6 @@ if archivo_subido is not None or (boton_manual and texto_manual):
 
     st.markdown("---")
 
-    # Pestañas
     tab1, tab2, tab3 = st.tabs(["📊 Gráficos", "✏️ Editar Datos", "🤖 Asistente Copilot"])
 
     with tab1:
@@ -334,27 +481,14 @@ if archivo_subido is not None or (boton_manual and texto_manual):
 
     with tab2:
         st.markdown("### ✏️ Edición Interactiva de Datos")
-        st.caption("¿El escáner cometió un error? Haz doble clic en cualquier celda para corregir.")
-        
-        df_editado = st.data_editor(
-            df_filtrado, 
-            use_container_width=True, 
-            num_rows="dynamic", 
-            hide_index=True
-        )
-        
+        df_editado = st.data_editor(df_filtrado, use_container_width=True, num_rows="dynamic", hide_index=True)
         csv = df_editado.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Descargar Datos Editados (CSV)", 
-            data=csv, 
-            file_name='reporte_corregido.csv', 
-            mime='text/csv'
-        )
+        st.download_button(label="📥 Descargar Datos Editados (CSV)", data=csv, file_name='reporte_corregido.csv', mime='text/csv')
 
     with tab3:
-        st.markdown("### 💬 Copilot de Datos (Análisis Avanzado)")
+        st.markdown("### 💬 Copilot de Datos")
         if "mensajes" not in st.session_state:
-            st.session_state.mensajes = [{"role": "assistant", "content": "¡Hola! Soy tu asistente de datos. Prueba preguntando:\n- 'Dame un resumen detallado'\n- 'Lista todos los productos'\n- '¿Cuáles son los productos de la competencia?'\n- '¿Cuánto gasté en total?'"}]
+            st.session_state.mensajes = [{"role": "assistant", "content": "¡Hola! Prueba preguntando:\n- 'Dame un resumen detallado'\n- 'Lista todos los productos'\n- '¿Cuáles son los productos de la competencia?'\n- '¿Cuánto gasté en total?'"}]
 
         for msg in st.session_state.mensajes:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -370,65 +504,36 @@ if archivo_subido is not None or (boton_manual and texto_manual):
                 resp = f"""**📊 Resumen Detallado:**
 - **Total Unidades:** {total_uds:,.0f} uds
 - **Gasto Total:** ${total_gasto:,.2f} MXN
-- **Total Líneas/Productos:** {len(df_filtrado)}
 - **Producto Estrella:** {top_prod}
-- **Tu Marca (Propio):** {total_prop:,.0f} uds ({pct_prop:.1f}%)
+- **Propio:** {total_prop:,.0f} uds ({pct_prop:.1f}%)
 - **Competencia:** {total_comp:,.0f} uds ({pct_comp:.1f}%)"""
-
             elif "lista" in txt or "productos" in txt or "todo" in txt:
                 if df_filtrado.empty:
-                    resp = "No hay productos en la lista actual."
+                    resp = "No hay productos."
                 else:
-                    resp = "**📋 Listado de Productos Extraídos:**\n\n"
-                    resp += "| Producto | Cantidad | Precio Unit. | Total | Origen |\n|---|---|---|---|---|\n"
+                    resp = "**📋 Productos:**\n\n| Producto | Cantidad | Total | Origen |\n|---|---|---|---|\n"
                     for _, row in df_filtrado.iterrows():
-                        resp += f"| {row['Producto']} | {row['Cantidad']} | ${row['Precio_Unitario']:,.2f} | ${row['Total']:,.2f} | {row['Origen']} |\n"
-
+                        resp += f"| {row['Producto']} | {row['Cantidad']} | ${row['Total']:,.2f} | {row['Origen']} |\n"
             elif "competencia" in txt:
                 df_comp = df_filtrado[df_filtrado['Origen'] == 'Competencia']
-                if df_comp.empty:
-                    resp = "No se detectaron productos de la competencia en este documento."
-                else:
-                    resp = f"**🔴 Productos de la Competencia ({total_comp:,.0f} uds):**\n\n"
-                    for _, row in df_comp.iterrows():
-                        resp += f"- **{row['Producto']}**: {row['Cantidad']} uds | Total: ${row['Total']:,.2f}\n"
-
-            elif "propio" in txt or "marca" in txt or "mía" in txt:
+                resp = f"**🔴 Competencia ({total_comp:,.0f} uds):**\n\n" + "\n".join([f"- {r['Producto']}: {r['Cantidad']} uds" for _, r in df_comp.iterrows()]) if not df_comp.empty else "No hay competencia."
+            elif "propio" in txt or "marca" in txt:
                 df_prop = df_filtrado[df_filtrado['Origen'] == 'Propio']
-                resp = f"**🔵 Tus Productos ({total_prop:,.0f} uds):**\n\n"
-                for _, row in df_prop.iterrows():
-                    resp += f"- **{row['Producto']}**: {row['Cantidad']} uds | Total: ${row['Total']:,.2f}\n"
-
-            elif "gasto" in txt or "dinero" in txt or "total" in txt:
-                resp = f"💰 **Análisis de Gasto:**\n\nEl gasto total detectado es de **${total_gasto:,.2f} MXN**.\n\n"
-                if not df_filtrado.empty:
-                    top_gasto = df_filtrado.groupby('Producto')['Total'].sum().nlargest(3)
-                    resp += "**Top 3 productos que más gasto generaron:**\n"
-                    for prod, monto in top_gasto.items():
-                        resp += f"- {prod}: ${monto:,.2f}\n"
-
-            elif "top" in txt or "mejor" in txt or "más" in txt:
-                if df_filtrado.empty:
-                    resp = "No hay productos para calcular el Top."
-                else:
-                    top = df_filtrado.groupby(['Producto', 'Origen'])['Cantidad'].sum().reset_index().nlargest(5, 'Cantidad')
-                    resp = "**🏆 Top 5 Productos por Unidades:**\n\n"
-                    for _, row in top.iterrows():
-                        resp += f"- **{row['Producto']}** ({row['Origen']}): {row['Cantidad']} uds\n"
-
+                resp = f"**🔵 Propio ({total_prop:,.0f} uds):**\n\n" + "\n".join([f"- {r['Producto']}: {r['Cantidad']} uds" for _, r in df_prop.iterrows()])
+            elif "gasto" in txt or "dinero" in txt:
+                resp = f"💰 **Gasto Total:** ${total_gasto:,.2f} MXN"
             else:
                 encontrado = False
                 for _, row in df_filtrado.iterrows():
                     if row['Producto'].lower() in txt:
-                        resp = f"🔍 **Detalle del producto encontrado:**\n- **Producto:** {row['Producto']}\n- **Cantidad:** {row['Cantidad']} uds\n- **Precio Unitario:** ${row['Precio_Unitario']:,.2f}\n- **Total:** ${row['Total']:,.2f}\n- **Origen:** {row['Origen']}"
+                        resp = f"🔍 **{row['Producto']}** - Cantidad: {row['Cantidad']} uds, Total: ${row['Total']:,.2f}"
                         encontrado = True
                         break
-                
                 if not encontrado:
-                    resp = f"No encontré una coincidencia exacta para '{prompt}'. Intenta usar palabras clave como 'resumen', 'lista', 'competencia', 'propio', 'gasto' o el nombre exacto de un producto."
+                    resp = f"No encontré '{prompt}'. Prueba 'resumen', 'lista', 'competencia', 'propio' o 'gasto'."
 
             st.session_state.mensajes.append({"role": "assistant", "content": resp})
             st.chat_message("assistant").write(resp)
 
 else:
-    st.info("👋 Sube un archivo (Excel, PDF, Imagen) o pega el texto de un ticket en el panel lateral para comenzar.")
+    st.info("👋 Sube un archivo o pega el texto de un ticket en el panel lateral.")
